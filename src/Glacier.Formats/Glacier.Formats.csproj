@@ -1,0 +1,31 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+    <LangVersion>preview</LangVersion>
+    <GenerateDocumentationFile>true</GenerateDocumentationFile>
+    <IsAotCompatible>true</IsAotCompatible>
+    <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
+    <TieredPGO>true</TieredPGO>
+    <NoWarn>$(NoWarn);CS1591;CS8981</NoWarn>
+
+    <!-- NuGet Package Properties -->
+    <PackageId>Glacier.Formats</PackageId>
+    <Version>1.0.0</Version>
+    <Authors>Ian Cowley</Authors>
+    <Company>Glacier High-Performance Ecosystem</Company>
+    <Description>Pure C# .NET 10 Zero-Allocation Columnar Interchange Formats (Apache Arrow IPC streaming/file format and Vectorized Parquet reader/writer with pure C# Thrift parsing, RLE/Bit-Packing, and SIMD Snappy compression).</Description>
+    <PackageLicenseExpression>MIT</PackageLicenseExpression>
+    <PackageProjectUrl>https://github.com/ian-cowley/Glacier.Formats</PackageProjectUrl>
+    <RepositoryUrl>https://github.com/ian-cowley/Glacier.Formats.git</RepositoryUrl>
+    <RepositoryType>git</RepositoryType>
+    <PackageTags>arrow;parquet;columnar;ipc;snappy;thrift;simd;net10;aot;glacier</PackageTags>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <InternalsVisibleTo Include="Glacier.Formats.Tests" />
+    <InternalsVisibleTo Include="Glacier.Storage" />
+  </ItemGroup>
+</Project>
