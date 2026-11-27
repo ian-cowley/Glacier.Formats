@@ -107,6 +107,13 @@ public sealed class ArrowColumn
         if (offset < 0 || length < 0 || offset + length > Length)
             throw new ArgumentOutOfRangeException();
 
+        ReadOnlyMemory<byte> slicedNullBitmap = ReadOnlyMemory<byte>.Empty;
+        int slicedNullCount = 0;
+        if (NullCount > 0 && !NullBitmap.IsEmpty)
+        {
+            slicedNullBitmap = SliceBitmap(NullBitmap.Span, offset, length, out slicedNullCount);
+        }
+
         // Calculate sliced buffers
         if (Field.DataType.Id == ArrowTypeId.Utf8 || Field.DataType.Id == ArrowTypeId.Binary)
         {
@@ -124,7 +131,12 @@ public sealed class ArrowColumn
             byte[] newOffsetsBytes = MemoryMarshal.AsBytes(newOffsets.AsSpan()).ToArray();
             ReadOnlyMemory<byte> slicedData = DataBuffer.Slice(dataStart, dataLen);
 
-            return new ArrowColumn(Field, length, 0, ReadOnlyMemory<byte>.Empty, newOffsetsBytes, slicedData);
+            return new ArrowColumn(Field, length, slicedNullCount, slicedNullBitmap, newOffsetsBytes, slicedData);
+        }
+        else if (Field.DataType.Id == ArrowTypeId.Boolean)
+        {
+            byte[] slicedBits = SliceBitmap(DataBuffer.Span, offset, length, out _);
+            return new ArrowColumn(Field, length, slicedNullCount, slicedNullBitmap, ReadOnlyMemory<byte>.Empty, slicedBits);
         }
         else
         {
@@ -133,8 +145,29 @@ public sealed class ArrowColumn
             int byteLen = length * elemSize;
             ReadOnlyMemory<byte> slicedData = DataBuffer.Slice(byteStart, byteLen);
 
-            return new ArrowColumn(Field, length, 0, ReadOnlyMemory<byte>.Empty, ReadOnlyMemory<byte>.Empty, slicedData);
+            return new ArrowColumn(Field, length, slicedNullCount, slicedNullBitmap, ReadOnlyMemory<byte>.Empty, slicedData);
         }
+    }
+
+    private static byte[] SliceBitmap(ReadOnlySpan<byte> src, int bitOffset, int bitLength, out int zeroBitCount)
+    {
+        byte[] dst = new byte[(bitLength + 7) / 8];
+        int zeros = 0;
+        for (int i = 0; i < bitLength; i++)
+        {
+            int srcIdx = bitOffset + i;
+            bool isSet = (src[srcIdx >> 3] & (1 << (srcIdx & 7))) != 0;
+            if (isSet)
+            {
+                dst[i >> 3] |= (byte)(1 << (i & 7));
+            }
+            else
+            {
+                zeros++;
+            }
+        }
+        zeroBitCount = zeros;
+        return dst;
     }
 }
 

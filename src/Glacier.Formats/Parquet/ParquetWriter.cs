@@ -42,6 +42,11 @@ public static class ParquetWriter
         ArgumentNullException.ThrowIfNull(stream);
         ArgumentNullException.ThrowIfNull(batches);
 
+        if (codec != CompressionCodec.Uncompressed && codec != CompressionCodec.Snappy)
+        {
+            throw new NotSupportedException($"Unsupported Parquet compression codec '{codec}'. Supported codecs: Uncompressed, Snappy.");
+        }
+
         // 1. Write PAR1 magic header
         stream.Write(Magic);
 
@@ -197,22 +202,77 @@ public static class ParquetWriter
 
     private static byte[] EncodeColumnData(ArrowColumn col)
     {
-        if (col.Field.DataType.Id == ArrowTypeId.Utf8 || col.Field.DataType.Id == ArrowTypeId.Binary)
+        if (col.NullCount > 0)
         {
-            using var ms = new MemoryStream();
-            Span<byte> len = stackalloc byte[4];
-            for (int i = 0; i < col.Length; i++)
-            {
-                var bytes = col.GetBytes(i);
-                BinaryPrimitives.WriteInt32LittleEndian(len, bytes.Length);
-                ms.Write(len);
-                ms.Write(bytes);
-            }
-            return ms.ToArray();
+            throw new NotSupportedException(
+                $"ParquetWriter does not support null values in column '{col.Field.Name}' (NullCount={col.NullCount}; definition levels are not encoded).");
         }
-        else
+
+        switch (col.Field.DataType.Id)
         {
-            return col.DataBuffer.ToArray();
+            case ArrowTypeId.Utf8:
+            case ArrowTypeId.Binary:
+            {
+                using var ms = new MemoryStream();
+                Span<byte> len = stackalloc byte[4];
+                for (int i = 0; i < col.Length; i++)
+                {
+                    var bytes = col.GetBytes(i);
+                    BinaryPrimitives.WriteInt32LittleEndian(len, bytes.Length);
+                    ms.Write(len);
+                    ms.Write(bytes);
+                }
+                return ms.ToArray();
+            }
+
+            case ArrowTypeId.Int8:
+            {
+                var src = col.DataBuffer.Span;
+                var widened = new byte[checked(col.Length * sizeof(int))];
+                for (int i = 0; i < col.Length; i++)
+                {
+                    BinaryPrimitives.WriteInt32LittleEndian(widened.AsSpan(i * 4, 4), unchecked((sbyte)src[i]));
+                }
+                return widened;
+            }
+
+            case ArrowTypeId.UInt8:
+            {
+                var src = col.DataBuffer.Span;
+                var widened = new byte[checked(col.Length * sizeof(int))];
+                for (int i = 0; i < col.Length; i++)
+                {
+                    BinaryPrimitives.WriteInt32LittleEndian(widened.AsSpan(i * 4, 4), src[i]);
+                }
+                return widened;
+            }
+
+            case ArrowTypeId.Int16:
+            {
+                var src = col.DataBuffer.Span;
+                var widened = new byte[checked(col.Length * sizeof(int))];
+                for (int i = 0; i < col.Length; i++)
+                {
+                    short v = BinaryPrimitives.ReadInt16LittleEndian(src.Slice(i * 2, 2));
+                    BinaryPrimitives.WriteInt32LittleEndian(widened.AsSpan(i * 4, 4), v);
+                }
+                return widened;
+            }
+
+            case ArrowTypeId.UInt16:
+            {
+                var src = col.DataBuffer.Span;
+                var widened = new byte[checked(col.Length * sizeof(int))];
+                for (int i = 0; i < col.Length; i++)
+                {
+                    ushort v = BinaryPrimitives.ReadUInt16LittleEndian(src.Slice(i * 2, 2));
+                    BinaryPrimitives.WriteInt32LittleEndian(widened.AsSpan(i * 4, 4), v);
+                }
+                return widened;
+            }
+
+            default:
+                return col.DataBuffer.ToArray();
         }
     }
 

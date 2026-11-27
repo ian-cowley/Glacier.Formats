@@ -223,9 +223,17 @@ public sealed class ThriftCompactReader
         return BinaryPrimitives.ReadDoubleLittleEndian(bytes);
     }
 
+    private const int MaxBinaryLength = 64 * 1024 * 1024;
+    private const int MaxCollectionLength = 10_000_000;
+    private const int MaxSkipDepth = 64;
+
     public byte[] ReadBinary()
     {
         int length = (int)ReadVarint32();
+        if (length < 0 || length > MaxBinaryLength)
+        {
+            throw new InvalidDataException($"Thrift binary length {length} out of valid bounds.");
+        }
         var bytes = new byte[length];
         ReadExact(bytes);
         return bytes;
@@ -250,10 +258,21 @@ public sealed class ThriftCompactReader
         {
             size = s;
         }
+        if (size < 0 || size > MaxCollectionLength)
+        {
+            throw new InvalidDataException($"Thrift collection length {size} out of valid bounds.");
+        }
     }
 
-    public void Skip(ThriftType type)
+    public void Skip(ThriftType type) => Skip(type, depth: 0);
+
+    private void Skip(ThriftType type, int depth)
     {
+        if (depth > MaxSkipDepth)
+        {
+            throw new InvalidDataException($"Thrift nesting depth exceeded {MaxSkipDepth}.");
+        }
+
         switch (type)
         {
             case ThriftType.BooleanTrue:
@@ -280,12 +299,36 @@ public sealed class ThriftCompactReader
             case ThriftType.List:
             case ThriftType.Set:
                 ReadListBegin(out var elemType, out int listSize);
-                for (int i = 0; i < listSize; i++) Skip(elemType);
+                for (int i = 0; i < listSize; i++) Skip(elemType, depth + 1);
                 break;
+            case ThriftType.Map:
+            {
+                int mapSize = (int)ReadVarint32();
+                if (mapSize < 0 || mapSize > MaxCollectionLength)
+                {
+                    throw new InvalidDataException($"Thrift map length {mapSize} out of valid bounds.");
+                }
+                if (mapSize > 0)
+                {
+                    byte kvType = ReadByte();
+                    var keyType = (ThriftType)((kvType >> 4) & 0x0F);
+                    var valType = (ThriftType)(kvType & 0x0F);
+                    for (int i = 0; i < mapSize; i++)
+                    {
+                        Skip(keyType, depth + 1);
+                        Skip(valType, depth + 1);
+                    }
+                }
+                break;
+            }
             case ThriftType.Struct:
+            {
+                short savedLastFieldId = _lastFieldId;
                 ReadStructBegin();
-                while (ReadFieldBegin(out _, out var fType)) Skip(fType);
+                while (ReadFieldBegin(out _, out var fType)) Skip(fType, depth + 1);
+                _lastFieldId = savedLastFieldId;
                 break;
+            }
         }
     }
 

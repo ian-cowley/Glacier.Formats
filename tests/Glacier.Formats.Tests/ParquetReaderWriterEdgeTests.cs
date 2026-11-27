@@ -165,9 +165,154 @@ public class ParquetReaderWriterEdgeTests
         byte[] badMetaLen = "PAR1\xFF\x00\x00\x00PAR1"u8.ToArray();
         Assert.Throws<InvalidDataException>(() => ParquetReader.ReadBytes(badMetaLen));
 
-        // Unsupported codec (e.g., Gzip)
+        // Writer rejects unsupported codecs instead of emitting corrupt uncompressed-labeled pages
         var batch = CreateSampleBatch(3, 0, true);
-        byte[] gzipParquet = ParquetWriter.WriteToBytes(batch, CompressionCodec.Gzip);
-        Assert.Throws<NotSupportedException>(() => ParquetReader.ReadBytes(gzipParquet));
+        Assert.Throws<NotSupportedException>(() => ParquetWriter.WriteToBytes(batch, CompressionCodec.Gzip));
+
+        // Construct a synthetic Gzip-labeled Parquet buffer to verify ParquetReader also rejects unsupported codecs
+        using var gzMs = new MemoryStream();
+        gzMs.Write("PAR1"u8);
+        long chunkStart = gzMs.Position;
+        byte[] rawPayload = [1, 0, 0, 0, 2, 0, 0, 0, 3, 0, 0, 0];
+        var ph = new PageHeader
+        {
+            Type = PageType.DataPage,
+            UncompressedPageSize = rawPayload.Length,
+            CompressedPageSize = rawPayload.Length,
+            DataPageHeader = new DataPageHeader
+            {
+                NumValues = 3,
+                Encoding = ParquetEncoding.Plain,
+                DefinitionLevelEncoding = ParquetEncoding.Rle,
+                RepetitionLevelEncoding = ParquetEncoding.Rle
+            }
+        };
+        ParquetThriftCodec.WritePageHeader(new ThriftCompactWriter(gzMs), ph);
+        gzMs.Write(rawPayload);
+        var fm = new FileMetaData
+        {
+            Version = 1,
+            Schema = [
+                new SchemaElement { Name = "schema", NumChildren = 1 },
+                new SchemaElement { Name = "a", Type = ParquetType.Int32, RepetitionType = FieldRepetitionType.Required }
+            ],
+            NumRows = 3,
+            RowGroups = [
+                new RowGroup
+                {
+                    NumRows = 3,
+                    TotalByteSize = rawPayload.Length,
+                    Columns = [
+                        new ColumnChunk
+                        {
+                            FileOffset = chunkStart,
+                            MetaData = new ColumnMetaData
+                            {
+                                Type = ParquetType.Int32,
+                                Encodings = [ParquetEncoding.Plain],
+                                PathInSchema = ["a"],
+                                Codec = CompressionCodec.Gzip,
+                                NumValues = 3,
+                                TotalUncompressedSize = rawPayload.Length,
+                                TotalCompressedSize = rawPayload.Length,
+                                DataPageOffset = chunkStart
+                            }
+                        }
+                    ]
+                }
+            ]
+        };
+        using var metaMs = new MemoryStream();
+        ParquetThriftCodec.WriteFileMetaData(new ThriftCompactWriter(metaMs), fm);
+        byte[] metaBytes = metaMs.ToArray();
+        gzMs.Write(metaBytes);
+        Span<byte> lenSpan = stackalloc byte[4];
+        System.Buffers.Binary.BinaryPrimitives.WriteUInt32LittleEndian(lenSpan, (uint)metaBytes.Length);
+        gzMs.Write(lenSpan);
+        gzMs.Write("PAR1"u8);
+        Assert.Throws<NotSupportedException>(() => ParquetReader.ReadBytes(gzMs.ToArray()));
+    }
+
+    [Fact]
+    public void ParquetWriter_WidensNarrowIntegersAndRejectsNullValues()
+    {
+        var schema = new ArrowSchema([
+            new ArrowField("i16", ArrowType.Int16, isNullable: false),
+            new ArrowField("u8", ArrowType.UInt8, isNullable: false)
+        ]);
+        short[] i16Vals = [-300, 0, 12345];
+        byte[] u8Vals = [1, 200, 255];
+        var batch = new ArrowRecordBatch(schema, 3, [
+            new ArrowColumn(schema.GetField(0), 3, 0, ReadOnlyMemory<byte>.Empty, ReadOnlyMemory<byte>.Empty, MemoryMarshal.AsBytes(i16Vals.AsSpan()).ToArray()),
+            new ArrowColumn(schema.GetField(1), 3, 0, ReadOnlyMemory<byte>.Empty, ReadOnlyMemory<byte>.Empty, u8Vals)
+        ]);
+
+        byte[] parquet = ParquetWriter.WriteToBytes(batch, CompressionCodec.Uncompressed);
+        var read = ParquetReader.ReadBytes(parquet);
+        Assert.Equal(3, read.RowCount);
+        Assert.Equal(-300, read.Column(0).GetInt32(0));
+        Assert.Equal(12345, read.Column(0).GetInt32(2));
+        Assert.Equal(200, read.Column(1).GetInt32(1));
+        Assert.Equal(255, read.Column(1).GetInt32(2));
+
+        var nullSchema = new ArrowSchema([new ArrowField("x", ArrowType.Int32, isNullable: true)]);
+        byte[] bitmap = [0b00000101]; // index 1 is null
+        var nullBatch = new ArrowRecordBatch(nullSchema, 3, [
+            new ArrowColumn(nullSchema.GetField(0), 3, 1, bitmap, ReadOnlyMemory<byte>.Empty, new byte[12])
+        ]);
+        Assert.Throws<NotSupportedException>(() => ParquetWriter.WriteToBytes(nullBatch, CompressionCodec.Uncompressed));
+    }
+
+    [Fact]
+    public void ArrowColumn_Slice_BitPackedBooleanAndNullBitmap_PreservesBitsAndNulls()
+    {
+        var boolField = new ArrowField("flags", ArrowType.Boolean, isNullable: true);
+        // 10 rows: bits [T, F, T, T, F, T, F, F, T, T], nulls at indices 1 and 9
+        byte[] data = [0b00101101, 0b00000011];
+        byte[] nulls = [0b11111101, 0b00000001]; // bit 1 = 0, bit 9 = 0
+        var col = new ArrowColumn(boolField, 10, 2, nulls, ReadOnlyMemory<byte>.Empty, data);
+
+        // Slice starting at non-byte-aligned offset 1, length 8 (indices 1..8)
+        var sliced = col.Slice(1, 8);
+        Assert.Equal(8, sliced.Length);
+        Assert.Equal(1, sliced.NullCount);
+        Assert.True(sliced.IsNull(0)); // orig index 1
+        Assert.False(sliced.IsNull(7)); // orig index 8
+        Assert.True(sliced.GetBoolean(1)); // orig index 2
+        Assert.True(sliced.GetBoolean(2)); // orig index 3
+        Assert.False(sliced.GetBoolean(3)); // orig index 4
+        Assert.True(sliced.GetBoolean(4)); // orig index 5
+        Assert.False(sliced.GetBoolean(5)); // orig index 6
+        Assert.True(sliced.GetBoolean(7)); // orig index 8
+    }
+
+    [Fact]
+    public void ThriftCompactReader_SkipMap_ConsumesKeyValuePairsSafely()
+    {
+        using var ms = new MemoryStream();
+        var writer = new ThriftCompactWriter(ms);
+        writer.WriteStructBegin();
+        writer.WriteFieldBegin(1, ThriftType.Map);
+        writer.WriteByte(2); // map size = 2 (varint)
+        writer.WriteByte((byte)(((byte)ThriftType.Binary << 4) | (byte)ThriftType.I32));
+        writer.WriteString("k1");
+        writer.WriteI32(101);
+        writer.WriteString("k2");
+        writer.WriteI32(202);
+        writer.WriteFieldBegin(2, ThriftType.I32);
+        writer.WriteI32(999);
+        writer.WriteFieldStop();
+
+        ms.Position = 0;
+        var reader = new ThriftCompactReader(ms);
+        reader.ReadStructBegin();
+        Assert.True(reader.ReadFieldBegin(out short f1, out var t1));
+        Assert.Equal(1, f1);
+        Assert.Equal(ThriftType.Map, t1);
+        reader.Skip(t1);
+        Assert.True(reader.ReadFieldBegin(out short f2, out _));
+        Assert.Equal(2, f2);
+        Assert.Equal(999, reader.ReadI32());
+        Assert.False(reader.ReadFieldBegin(out _, out _));
     }
 }

@@ -5,6 +5,7 @@ using System.Buffers.Binary;
 using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
 using System.Runtime.Intrinsics;
+using System.Runtime.Intrinsics.X86;
 
 /// <summary>
 /// Vectorized bit-unpacking engine using Vector256/Vector512 SIMD and 64-bit unaligned bit-slicing.
@@ -61,12 +62,28 @@ public static class VectorizedBitUnpacker
         UnpackGeneric(packed, bitWidth, destination);
     }
 
+    private static readonly Vector256<uint> Bit1Shifts = Vector256.Create(0u, 1u, 2u, 3u, 4u, 5u, 6u, 7u);
+    private static readonly Vector256<uint> Bit2Shifts = Vector256.Create(0u, 2u, 4u, 6u, 8u, 10u, 12u, 14u);
+
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public static void Unpack1Bit(ReadOnlySpan<byte> packed, Span<uint> destination)
     {
         int totalValues = destination.Length;
         int i = 0;
         int byteIdx = 0;
+
+        if (Avx2.IsSupported && totalValues >= 8 && packed.Length >= 1)
+        {
+            var mask1 = Vector256<uint>.One;
+            var shifts = Bit1Shifts;
+            ref uint dstRef = ref MemoryMarshal.GetReference(destination);
+            while (i <= totalValues - 8 && byteIdx < packed.Length)
+            {
+                var v = Avx2.And(Avx2.ShiftRightLogicalVariable(Vector256.Create((uint)packed[byteIdx++]), shifts), mask1);
+                v.StoreUnsafe(ref Unsafe.Add(ref dstRef, i));
+                i += 8;
+            }
+        }
 
         while (i <= totalValues - 8 && byteIdx < packed.Length)
         {
@@ -100,6 +117,21 @@ public static class VectorizedBitUnpacker
         int i = 0;
         int byteIdx = 0;
 
+        if (Avx2.IsSupported && totalValues >= 8 && packed.Length >= 2)
+        {
+            var mask2 = Vector256.Create(0x03u);
+            var shifts = Bit2Shifts;
+            ref uint dstRef = ref MemoryMarshal.GetReference(destination);
+            while (i <= totalValues - 8 && byteIdx + 1 < packed.Length)
+            {
+                uint word = BinaryPrimitives.ReadUInt16LittleEndian(packed.Slice(byteIdx, 2));
+                var v = Avx2.And(Avx2.ShiftRightLogicalVariable(Vector256.Create(word), shifts), mask2);
+                v.StoreUnsafe(ref Unsafe.Add(ref dstRef, i));
+                byteIdx += 2;
+                i += 8;
+            }
+        }
+
         while (i <= totalValues - 4 && byteIdx < packed.Length)
         {
             byte b = packed[byteIdx++];
@@ -123,11 +155,34 @@ public static class VectorizedBitUnpacker
     }
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    public static void Unpack4Bit(ReadOnlySpan<byte> packed, Span<uint> destination)
+    public static unsafe void Unpack4Bit(ReadOnlySpan<byte> packed, Span<uint> destination)
     {
         int totalValues = destination.Length;
         int i = 0;
         int byteIdx = 0;
+
+        if (Avx2.IsSupported && totalValues >= 16 && packed.Length >= 8)
+        {
+            var maskLow = Vector128.Create((byte)0x0F);
+            fixed (byte* pSrc = packed)
+            fixed (uint* pDst = destination)
+            {
+                while (i <= totalValues - 16 && byteIdx <= packed.Length - 8)
+                {
+                    Vector128<byte> packed8 = Vector128.CreateScalarUnsafe(*(ulong*)(pSrc + byteIdx)).AsByte();
+                    Vector128<byte> lo = Sse2.And(packed8, maskLow);
+                    Vector128<byte> hi = Sse2.And(Sse2.ShiftRightLogical(packed8.AsUInt16(), 4).AsByte(), maskLow);
+                    Vector128<byte> interleaved = Sse2.UnpackLow(lo, hi);
+
+                    Vector256<int> w0 = Avx2.ConvertToVector256Int32(interleaved);
+                    Vector256<int> w1 = Avx2.ConvertToVector256Int32(Sse2.ShiftRightLogical128BitLane(interleaved, 8));
+                    w0.AsUInt32().Store(pDst + i);
+                    w1.AsUInt32().Store(pDst + i + 8);
+                    byteIdx += 8;
+                    i += 16;
+                }
+            }
+        }
 
         while (i <= totalValues - 2 && byteIdx < packed.Length)
         {
@@ -144,21 +199,51 @@ public static class VectorizedBitUnpacker
     }
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    public static void Unpack8Bit(ReadOnlySpan<byte> packed, Span<uint> destination)
+    public static unsafe void Unpack8Bit(ReadOnlySpan<byte> packed, Span<uint> destination)
     {
         int count = Math.Min(packed.Length, destination.Length);
-        for (int i = 0; i < count; i++)
+        int i = 0;
+
+        if (Avx2.IsSupported && count >= 8)
+        {
+            fixed (byte* pSrc = packed)
+            fixed (uint* pDst = destination)
+            {
+                int limit = count - 8;
+                for (; i <= limit; i += 8)
+                {
+                    Avx2.ConvertToVector256Int32(pSrc + i).AsUInt32().Store(pDst + i);
+                }
+            }
+        }
+
+        for (; i < count; i++)
         {
             destination[i] = packed[i];
         }
     }
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    public static void Unpack16Bit(ReadOnlySpan<byte> packed, Span<uint> destination)
+    public static unsafe void Unpack16Bit(ReadOnlySpan<byte> packed, Span<uint> destination)
     {
         ReadOnlySpan<ushort> src = MemoryMarshal.Cast<byte, ushort>(packed);
         int count = Math.Min(src.Length, destination.Length);
-        for (int i = 0; i < count; i++)
+        int i = 0;
+
+        if (Avx2.IsSupported && count >= 8)
+        {
+            fixed (ushort* pSrc = src)
+            fixed (uint* pDst = destination)
+            {
+                int limit = count - 8;
+                for (; i <= limit; i += 8)
+                {
+                    Avx2.ConvertToVector256Int32(pSrc + i).AsUInt32().Store(pDst + i);
+                }
+            }
+        }
+
+        for (; i < count; i++)
         {
             destination[i] = src[i];
         }
