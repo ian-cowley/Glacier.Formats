@@ -1,6 +1,7 @@
 namespace Glacier.Formats.Parquet;
 
 using System;
+using System.Buffers;
 using System.Buffers.Binary;
 using System.IO;
 using System.Numerics;
@@ -8,14 +9,20 @@ using System.Runtime.CompilerServices;
 
 /// <summary>
 /// Pure C# high-performance Snappy compressor and decompressor.
-/// Employs 64-bit unaligned memory copies (ulong blits), dynamic hash sizing, and strict bounds verification.
+/// Employs 64-bit unaligned memory copies (ulong blits), dynamic hash sizing (stackalloc &lt;= 4 KB, pooled above), and strict bounds verification.
 /// Zero external dependencies, trim-safe, and Native AOT compatible.
 /// </summary>
 public static unsafe class SnappyCodec
 {
     private const int MinHashTableSize = 256;
     private const int MaxHashTableSize = 16384;
+    private const int StackAllocHashThreshold = 1024; // 1024 * 4 = 4096 bytes max on stack
 
+    /// <summary>
+    /// Returns the worst-case compressed byte length for a Snappy block of <paramref name="sourceLength"/> bytes.
+    /// </summary>
+    /// <param name="sourceLength">The uncompressed input length in bytes.</param>
+    /// <returns>The maximum possible Snappy compressed byte length.</returns>
     public static int GetMaxCompressedLength(int sourceLength)
     {
         if (sourceLength < 0)
@@ -32,6 +39,12 @@ public static unsafe class SnappyCodec
         return (int)max;
     }
 
+    /// <summary>
+    /// Compresses <paramref name="source"/> in Snappy block format into <paramref name="destination"/>.
+    /// </summary>
+    /// <param name="source">The uncompressed input bytes.</param>
+    /// <param name="destination">The destination span receiving the compressed Snappy block.</param>
+    /// <returns>The number of compressed bytes written to <paramref name="destination"/>.</returns>
     public static int Compress(ReadOnlySpan<byte> source, Span<byte> destination)
     {
         if (source.IsEmpty)
@@ -44,106 +57,163 @@ public static unsafe class SnappyCodec
             return 1;
         }
 
-        fixed (byte* pSrc = source)
-        fixed (byte* pDst = destination)
+        if (source.Length < 16)
         {
-            byte* dst = pDst;
-            byte* dstEnd = pDst + destination.Length;
-            byte* src = pSrc;
-            byte* srcEnd = src + source.Length;
-
-            // Write varint uncompressed length
-            uint uncompressedLen = (uint)source.Length;
-            while (uncompressedLen >= 0x80)
+            fixed (byte* pSrc = source)
+            fixed (byte* pDst = destination)
             {
-                if (dst >= dstEnd)
-                {
-                    throw new ArgumentException("Destination buffer is too small.", nameof(destination));
-                }
-                *dst++ = (byte)((uncompressedLen & 0x7F) | 0x80);
-                uncompressedLen >>= 7;
-            }
-            if (dst >= dstEnd)
-            {
-                throw new ArgumentException("Destination buffer is too small.", nameof(destination));
-            }
-            *dst++ = (byte)uncompressedLen;
-
-            if (source.Length < 16)
-            {
-                EmitLiteral(ref dst, dstEnd, src, source.Length);
+                byte* dst = pDst;
+                byte* dstEnd = pDst + destination.Length;
+                WriteVarintHeader(ref dst, dstEnd, (uint)source.Length);
+                EmitLiteral(ref dst, dstEnd, pSrc, source.Length);
                 return (int)(dst - pDst);
             }
+        }
 
-            // Dynamic power-of-2 stack-allocated hash table (256..16384 entries = 1 KB..64 KB)
-            int hashTableSize = MinHashTableSize;
-            while (hashTableSize < MaxHashTableSize && hashTableSize < source.Length)
-            {
-                hashTableSize <<= 1;
-            }
-            int shift = 32 - BitOperations.Log2((uint)hashTableSize);
+        // Dynamic power-of-2 hash table (256..16384 entries; stackalloc <= 4 KB, ArrayPool above)
+        int hashTableSize = MinHashTableSize;
+        while (hashTableSize < MaxHashTableSize && hashTableSize < source.Length)
+        {
+            hashTableSize <<= 1;
+        }
+        int shift = 32 - BitOperations.Log2((uint)hashTableSize);
 
+        if (hashTableSize <= StackAllocHashThreshold)
+        {
             int* table = stackalloc int[hashTableSize];
-            Unsafe.InitBlock(table, 0xFF, (uint)(hashTableSize * sizeof(int))); // initialize to -1
-
-            byte* anchor = src;
-            byte* limit = srcEnd - 4;
-
-            while (src <= limit)
+            fixed (byte* pSrc = source)
+            fixed (byte* pDst = destination)
             {
-                uint val = Unsafe.ReadUnaligned<uint>(src);
-                uint hash = (val * 0x1e35a7bd) >> shift;
-
-                int prevOffset = table[hash];
-                int curOffset = (int)(src - pSrc);
-                table[hash] = curOffset;
-
-                int candidateDistance = curOffset - prevOffset;
-                if (prevOffset >= 0 && candidateDistance > 0 && candidateDistance <= 65535)
-                {
-                    byte* match = pSrc + prevOffset;
-                    if (Unsafe.ReadUnaligned<uint>(match) == val)
-                    {
-                        // Emit pending literals
-                        int litLen = (int)(src - anchor);
-                        if (litLen > 0)
-                        {
-                            EmitLiteral(ref dst, dstEnd, anchor, litLen);
-                        }
-
-                        // Determine match length
-                        byte* matchStart = match;
-                        byte* srcStart = src;
-                        src += 4;
-                        match += 4;
-                        while (src < srcEnd && *src == *match)
-                        {
-                            src++;
-                            match++;
-                        }
-
-                        int matchLen = (int)(src - srcStart);
-                        int offset = (int)(srcStart - matchStart);
-
-                        EmitCopy(ref dst, dstEnd, offset, matchLen);
-                        anchor = src;
-                        continue;
-                    }
-                }
-
-                src++;
+                return CompressCore(pSrc, source.Length, pDst, destination.Length, table, hashTableSize, shift);
             }
+        }
 
-            // Emit final literals
-            if (anchor < srcEnd)
+        int[] rented = ArrayPool<int>.Shared.Rent(hashTableSize);
+        try
+        {
+            fixed (int* table = rented)
+            fixed (byte* pSrc = source)
+            fixed (byte* pDst = destination)
             {
-                EmitLiteral(ref dst, dstEnd, anchor, (int)(srcEnd - anchor));
+                return CompressCore(pSrc, source.Length, pDst, destination.Length, table, hashTableSize, shift);
             }
-
-            return (int)(dst - pDst);
+        }
+        finally
+        {
+            ArrayPool<int>.Shared.Return(rented);
         }
     }
 
+    private static int CompressCore(byte* pSrc, int srcLen, byte* pDst, int dstLen, int* table, int hashTableSize, int shift)
+    {
+        byte* dst = pDst;
+        byte* dstEnd = pDst + dstLen;
+        byte* src = pSrc;
+        byte* srcEnd = src + srcLen;
+
+        WriteVarintHeader(ref dst, dstEnd, (uint)srcLen);
+
+        Unsafe.InitBlock(table, 0xFF, (uint)(hashTableSize * sizeof(int))); // initialize to -1
+
+        byte* anchor = src;
+        byte* limit = srcEnd - 4;
+
+        while (src <= limit)
+        {
+            uint val = Unsafe.ReadUnaligned<uint>(src);
+            uint hash = (val * 0x1e35a7bd) >> shift;
+
+            int prevOffset = table[hash];
+            int curOffset = (int)(src - pSrc);
+            table[hash] = curOffset;
+
+            int candidateDistance = curOffset - prevOffset;
+            if (prevOffset >= 0 && candidateDistance > 0 && candidateDistance <= 65535)
+            {
+                byte* match = pSrc + prevOffset;
+                if (Unsafe.ReadUnaligned<uint>(match) == val)
+                {
+                    // Emit pending literals
+                    int litLen = (int)(src - anchor);
+                    if (litLen > 0)
+                    {
+                        EmitLiteral(ref dst, dstEnd, anchor, litLen);
+                    }
+
+                    // Determine match length using 64-bit XOR + TrailingZeroCount
+                    byte* matchStart = match;
+                    byte* srcStart = src;
+                    src += 4;
+                    match += 4;
+
+                    if (BitConverter.IsLittleEndian)
+                    {
+                        while (src <= srcEnd - 8)
+                        {
+                            ulong diff = Unsafe.ReadUnaligned<ulong>(src) ^ Unsafe.ReadUnaligned<ulong>(match);
+                            if (diff != 0)
+                            {
+                                src += BitOperations.TrailingZeroCount(diff) >> 3;
+                                goto MatchDone;
+                            }
+                            src += 8;
+                            match += 8;
+                        }
+                    }
+
+                    while (src < srcEnd && *src == *match)
+                    {
+                        src++;
+                        match++;
+                    }
+
+                MatchDone:
+                    int matchLen = (int)(src - srcStart);
+                    int offset = (int)(srcStart - matchStart);
+
+                    EmitCopy(ref dst, dstEnd, offset, matchLen);
+                    anchor = src;
+                    continue;
+                }
+            }
+
+            src++;
+        }
+
+        // Emit final literals
+        if (anchor < srcEnd)
+        {
+            EmitLiteral(ref dst, dstEnd, anchor, (int)(srcEnd - anchor));
+        }
+
+        return (int)(dst - pDst);
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static void WriteVarintHeader(ref byte* dst, byte* dstEnd, uint uncompressedLen)
+    {
+        while (uncompressedLen >= 0x80)
+        {
+            if (dst >= dstEnd)
+            {
+                throw new ArgumentException("Destination buffer is too small.", "destination");
+            }
+            *dst++ = (byte)((uncompressedLen & 0x7F) | 0x80);
+            uncompressedLen >>= 7;
+        }
+        if (dst >= dstEnd)
+        {
+            throw new ArgumentException("Destination buffer is too small.", "destination");
+        }
+        *dst++ = (byte)uncompressedLen;
+    }
+
+    /// <summary>
+    /// Decompresses a Snappy block from <paramref name="source"/> into <paramref name="destination"/>.
+    /// </summary>
+    /// <param name="source">The Snappy-compressed byte span.</param>
+    /// <param name="destination">The destination span receiving the decompressed bytes.</param>
+    /// <returns>The number of decompressed bytes written to <paramref name="destination"/>.</returns>
     public static int Decompress(ReadOnlySpan<byte> source, Span<byte> destination)
     {
         if (source.IsEmpty)
@@ -300,6 +370,8 @@ public static unsafe class SnappyCodec
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     private static void EmitLiteral(ref byte* dst, byte* dstEnd, byte* src, int length)
     {
+        if (length <= 0) return;
+
         uint n = (uint)(length - 1);
         int headerBytes = n switch
         {

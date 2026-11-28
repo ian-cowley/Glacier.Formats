@@ -234,7 +234,7 @@ public class ParquetReaderWriterEdgeTests
     }
 
     [Fact]
-    public void ParquetWriter_WidensNarrowIntegersAndRejectsNullValues()
+    public void ParquetWriter_WidensNarrowIntegersAndRoundtripsNullables()
     {
         var schema = new ArrowSchema([
             new ArrowField("i16", ArrowType.Int16, isNullable: false),
@@ -257,10 +257,25 @@ public class ParquetReaderWriterEdgeTests
 
         var nullSchema = new ArrowSchema([new ArrowField("x", ArrowType.Int32, isNullable: true)]);
         byte[] bitmap = [0b00000101]; // index 1 is null
+        int[] vals = [10, 0, 30];
         var nullBatch = new ArrowRecordBatch(nullSchema, 3, [
-            new ArrowColumn(nullSchema.GetField(0), 3, 1, bitmap, ReadOnlyMemory<byte>.Empty, new byte[12])
+            new ArrowColumn(nullSchema.GetField(0), 3, 1, bitmap, ReadOnlyMemory<byte>.Empty, MemoryMarshal.AsBytes(vals.AsSpan()).ToArray())
         ]);
-        Assert.Throws<NotSupportedException>(() => ParquetWriter.WriteToBytes(nullBatch, CompressionCodec.Uncompressed));
+        byte[] nullParquet = ParquetWriter.WriteToBytes(nullBatch, CompressionCodec.Uncompressed);
+        var nullRead = ParquetReader.ReadBytes(nullParquet);
+        Assert.Equal(3, nullRead.RowCount);
+        Assert.Equal(1, nullRead.Column(0).NullCount);
+        Assert.False(nullRead.Column(0).IsNull(0));
+        Assert.True(nullRead.Column(0).IsNull(1));
+        Assert.False(nullRead.Column(0).IsNull(2));
+        Assert.Equal(10, nullRead.Column(0).GetInt32(0));
+        Assert.Equal(30, nullRead.Column(0).GetInt32(2));
+
+        var reqSchema = new ArrowSchema([new ArrowField("x", ArrowType.Int32, isNullable: false)]);
+        var invalidReqBatch = new ArrowRecordBatch(reqSchema, 3, [
+            new ArrowColumn(reqSchema.GetField(0), 3, 1, bitmap, ReadOnlyMemory<byte>.Empty, MemoryMarshal.AsBytes(vals.AsSpan()).ToArray())
+        ]);
+        Assert.Throws<ArgumentException>(() => ParquetWriter.WriteToBytes(invalidReqBatch, CompressionCodec.Uncompressed));
     }
 
     [Fact]

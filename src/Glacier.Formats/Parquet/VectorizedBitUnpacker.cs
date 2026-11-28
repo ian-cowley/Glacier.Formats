@@ -6,25 +6,45 @@ using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
 using System.Runtime.Intrinsics;
 using System.Runtime.Intrinsics.X86;
+using Glacier.Formats.Encoding;
 
 /// <summary>
-/// Vectorized bit-unpacking engine using Vector256/Vector512 SIMD and 64-bit unaligned bit-slicing.
-/// Unpacks variable bit-width integers (1 to 32 bits) at maximum hardware throughput.
+/// Vectorized bit-unpacking engine using Vector256/Vector512 SIMD, FastLanes odd-width unpacking,
+/// and 64-bit unaligned bit-slicing.
+/// Unpacks variable bit-width integers (0 to 32 bits) at maximum hardware throughput.
 /// </summary>
 public static class VectorizedBitUnpacker
 {
+    /// <summary>
+    /// Unpacks <see cref="Span{UInt32}.Length"/> integers of bit-width <paramref name="bitWidth"/> from <paramref name="packed"/>.
+    /// </summary>
+    /// <param name="packed">The bit-packed source buffer.</param>
+    /// <param name="bitWidth">The bit-width of each packed integer (0 to 32).</param>
+    /// <param name="destination">The destination span receiving unpacked 32-bit unsigned integers.</param>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public static void Unpack(ReadOnlySpan<byte> packed, int bitWidth, Span<uint> destination)
     {
+        if ((uint)bitWidth > 32u)
+        {
+            throw new ArgumentOutOfRangeException(nameof(bitWidth), bitWidth, "Bit-width must be between 0 and 32.");
+        }
+
         if (bitWidth == 0)
         {
             destination.Clear();
             return;
         }
 
+        long requiredBytes = ((long)destination.Length * bitWidth + 7) >> 3;
+        if (packed.Length < requiredBytes)
+        {
+            throw new ArgumentException($"Packed buffer is too short. Required: {requiredBytes}, Actual: {packed.Length}", nameof(packed));
+        }
+
         if (bitWidth == 32)
         {
-            MemoryMarshal.Cast<byte, uint>(packed[..(destination.Length * sizeof(uint))]).CopyTo(destination);
+            int byteLen = checked(destination.Length * sizeof(uint));
+            MemoryMarshal.Cast<byte, uint>(packed[..byteLen]).CopyTo(destination);
             return;
         }
 
@@ -58,13 +78,30 @@ public static class VectorizedBitUnpacker
             return;
         }
 
-        // Generic 64-bit bit-slicing engine
-        UnpackGeneric(packed, bitWidth, destination);
+        // Odd / non-power-of-two bit-widths: process 16-lane chunks via FastLanesBitUnpacker, then scalar tail
+        int lanes16 = destination.Length & ~15;
+        int sliceByteLen = bitWidth * 2; // exact: (16 * bitWidth) / 8
+        int byteOffset = 0;
+        int i = 0;
+        for (; i < lanes16 && (long)byteOffset + sliceByteLen <= packed.Length; i += 16, byteOffset += sliceByteLen)
+        {
+            FastLanesBitUnpacker.Unpack16(packed.Slice(byteOffset), destination.Slice(i, 16), bitWidth);
+        }
+
+        if (i < destination.Length)
+        {
+            UnpackGeneric(packed.Slice(byteOffset), bitWidth, destination.Slice(i));
+        }
     }
 
     private static readonly Vector256<uint> Bit1Shifts = Vector256.Create(0u, 1u, 2u, 3u, 4u, 5u, 6u, 7u);
     private static readonly Vector256<uint> Bit2Shifts = Vector256.Create(0u, 2u, 4u, 6u, 8u, 10u, 12u, 14u);
 
+    /// <summary>
+    /// Unpacks 1-bit packed integers from <paramref name="packed"/> into <paramref name="destination"/>.
+    /// </summary>
+    /// <param name="packed">The 1-bit packed source buffer.</param>
+    /// <param name="destination">The destination span receiving unpacked values (0 or 1).</param>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public static void Unpack1Bit(ReadOnlySpan<byte> packed, Span<uint> destination)
     {
@@ -110,6 +147,11 @@ public static class VectorizedBitUnpacker
         }
     }
 
+    /// <summary>
+    /// Unpacks 2-bit packed integers from <paramref name="packed"/> into <paramref name="destination"/>.
+    /// </summary>
+    /// <param name="packed">The 2-bit packed source buffer.</param>
+    /// <param name="destination">The destination span receiving unpacked values (0..3).</param>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public static void Unpack2Bit(ReadOnlySpan<byte> packed, Span<uint> destination)
     {
@@ -154,6 +196,11 @@ public static class VectorizedBitUnpacker
         }
     }
 
+    /// <summary>
+    /// Unpacks 4-bit packed integers from <paramref name="packed"/> into <paramref name="destination"/>.
+    /// </summary>
+    /// <param name="packed">The 4-bit packed source buffer.</param>
+    /// <param name="destination">The destination span receiving unpacked values (0..15).</param>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public static unsafe void Unpack4Bit(ReadOnlySpan<byte> packed, Span<uint> destination)
     {
@@ -198,6 +245,11 @@ public static class VectorizedBitUnpacker
         }
     }
 
+    /// <summary>
+    /// Unpacks 8-bit packed integers from <paramref name="packed"/> into <paramref name="destination"/>.
+    /// </summary>
+    /// <param name="packed">The 8-bit packed source buffer.</param>
+    /// <param name="destination">The destination span receiving unpacked values (0..255).</param>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public static unsafe void Unpack8Bit(ReadOnlySpan<byte> packed, Span<uint> destination)
     {
@@ -223,6 +275,11 @@ public static class VectorizedBitUnpacker
         }
     }
 
+    /// <summary>
+    /// Unpacks 16-bit packed integers from <paramref name="packed"/> into <paramref name="destination"/>.
+    /// </summary>
+    /// <param name="packed">The 16-bit little-endian packed source buffer.</param>
+    /// <param name="destination">The destination span receiving unpacked values (0..65535).</param>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public static unsafe void Unpack16Bit(ReadOnlySpan<byte> packed, Span<uint> destination)
     {
@@ -249,19 +306,42 @@ public static class VectorizedBitUnpacker
         }
     }
 
+    /// <summary>
+    /// Unpacks integers of arbitrary <paramref name="bitWidth"/> (0 to 32) using 64-bit unaligned scalar bit-slicing.
+    /// </summary>
+    /// <param name="packed">The bit-packed source buffer.</param>
+    /// <param name="bitWidth">The bit-width of each packed integer (0 to 32).</param>
+    /// <param name="destination">The destination span receiving unpacked 32-bit unsigned integers.</param>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public static unsafe void UnpackGeneric(ReadOnlySpan<byte> packed, int bitWidth, Span<uint> destination)
     {
-        uint mask = (1u << bitWidth) - 1u;
+        if ((uint)bitWidth > 32u)
+        {
+            throw new ArgumentOutOfRangeException(nameof(bitWidth), bitWidth, "Bit-width must be between 0 and 32.");
+        }
+
+        if (bitWidth == 0)
+        {
+            destination.Clear();
+            return;
+        }
+
+        long requiredBytes = ((long)destination.Length * bitWidth + 7) >> 3;
+        if (packed.Length < requiredBytes)
+        {
+            throw new ArgumentException($"Packed buffer is too short. Required: {requiredBytes}, Actual: {packed.Length}", nameof(packed));
+        }
+
+        uint mask = bitWidth == 32 ? uint.MaxValue : ((1u << bitWidth) - 1u);
         int totalValues = destination.Length;
-        int bitOffset = 0;
+        long bitOffset = 0;
 
         fixed (byte* pSrc = packed)
         {
             for (int i = 0; i < totalValues; i++)
             {
-                int byteOffset = bitOffset >> 3;
-                int bitInByte = bitOffset & 7;
+                int byteOffset = (int)(bitOffset >> 3);
+                int bitInByte = (int)(bitOffset & 7);
 
                 // Safe 64-bit load if enough bytes remain
                 ulong chunk;

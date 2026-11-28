@@ -1,0 +1,4 @@
+<Solution>
+  <Project Path="src/Glacier.Formats/Glacier.Formats.csproj" />
+  <Project Path="tests/Glacier.Formats.Tests/Glacier.Formats.Tests.csproj" />
+</Solution>

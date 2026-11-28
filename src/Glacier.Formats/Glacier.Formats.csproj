@@ -9,20 +9,20 @@
     <IsAotCompatible>true</IsAotCompatible>
     <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
     <TieredPGO>true</TieredPGO>
-    <NoWarn>$(NoWarn);CS1591;CS8981</NoWarn>
+    <NoWarn>$(NoWarn);CS8981</NoWarn>
 
     <!-- NuGet Package Properties -->
     <PackageId>Glacier.Formats</PackageId>
     <Version>1.0.1</Version>
-    <PackageReleaseNotes>v1.0.1: AVX2/SSE2 SIMD VectorizedBitUnpacker for Parquet 1/2/4/8/16-bit decoding plus strict Parquet/Arrow slice and bounds validation.</PackageReleaseNotes>
+    <PackageReleaseNotes>v1.0.1: Hardened Glacier Compact Columnar IPC v1 framing, Parquet v1 RLE nullable definition levels, SnappyCodec ArrayPool/XOR optimization, canonical FastLanesBitUnpacker, and hardware Crc32c.</PackageReleaseNotes>
     <Authors>Ian Cowley</Authors>
     <Company>Glacier High-Performance Ecosystem</Company>
-    <Description>Pure C# .NET 10 Zero-Allocation Columnar Interchange Formats (Apache Arrow IPC streaming/file format and Vectorized Parquet reader/writer with pure C# Thrift parsing, RLE/Bit-Packing, and SIMD Snappy compression).</Description>
+    <Description>Pure C# .NET 10 Zero-Dependency Columnar Interchange Formats: Glacier Compact Columnar IPC v1 (Arrow-inspired columnar buffers with custom 16B header + 36B descriptor framing; not FlatBuffers wire-compatible), Parquet v1 reader/writer (Uncompressed/Snappy, PLAIN + RLE definition levels), FastLanesBitUnpacker, and hardware Crc32c.</Description>
     <PackageLicenseExpression>MIT</PackageLicenseExpression>
     <PackageProjectUrl>https://github.com/ian-cowley/Glacier.Formats</PackageProjectUrl>
     <RepositoryUrl>https://github.com/ian-cowley/Glacier.Formats.git</RepositoryUrl>
     <RepositoryType>git</RepositoryType>
-    <PackageTags>arrow;parquet;columnar;ipc;snappy;thrift;simd;net10;aot;glacier</PackageTags>
+    <PackageTags>glacier;columnar;ipc;parquet;snappy;thrift;fastlanes;crc32c;simd;net10;aot</PackageTags>
   </PropertyGroup>
 
   <ItemGroup>
